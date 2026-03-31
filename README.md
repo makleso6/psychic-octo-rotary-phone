@@ -1,217 +1,236 @@
 #!/usr/bin/env bash
+# setup/build_vsmlrt.sh - Сборка vs-mlrt из исходников для Ubuntu
 set -euo pipefail
 
-log() { echo -e "\033[1;32m[setup]\033[0m $*"; }
+log() { echo -e "\033[1;35m[vs-mlrt]\033[0m $*"; }
 err() { echo -e "\033[1;31m[ERROR]\033[0m $*" >&2; exit 1; }
 
-# ── Проверка виртуального окружения ──────────────────────────────────────────
-if [[ -z "${VIRTUAL_ENV:-}" ]]; then
-    err "Запусти из venv:\n  source venv/bin/activate"
+# ── Параметры ────────────────────────────────────────────────────────────────
+BACKEND=${BACKEND:-TRT}  # TRT, NCNN, ORT, OV
+BUILD_DIR="$HOME/build/vs-mlrt"
+VS_PLUGINS_DIR="$HOME/.local/lib/vapoursynth"
+
+log "Сборка vs-mlrt с бэкендом: $BACKEND"
+
+# ── Проверка зависимостей ────────────────────────────────────────────────────
+log "Проверка системных зависимостей..."
+
+command -v nvidia-smi &>/dev/null || err "NVIDIA драйвер не найден"
+command -v nvcc &>/dev/null || {
+    log "CUDA Toolkit не найден, устанавливаем..."
+    sudo apt install -y nvidia-cuda-toolkit
+}
+
+# Проверка VapourSynth
+python3 -c "import vapoursynth" 2>/dev/null || \
+    err "VapourSynth не установлен. Запусти: sudo apt install vapoursynth python3-vapoursynth libvapoursynth-dev"
+
+# ── Установка инструментов сборки ────────────────────────────────────────────
+log "Установка инструментов сборки..."
+sudo apt update
+sudo apt install -y \
+    git \
+    cmake \
+    ninja-build \
+    build-essential \
+    pkg-config \
+    vapoursynth-dev \
+    libvapoursynth-dev
+
+# ── Проверка TensorRT ────────────────────────────────────────────────────────
+if [[ "$BACKEND" == "TRT" ]]; then
+    log "Проверка TensorRT..."
+    
+    if [[ ! -d "/opt/tensorrt" ]] && [[ ! -f "/usr/include/NvInfer.h" ]]; then
+        err "TensorRT не найден!\n\
+  Установи TensorRT через:\n\
+    ./setup/install_tensorrt_tarball.sh\n\
+  или:\n\
+    sudo apt install tensorrt libnvinfer-dev"
+    fi
+    
+    # Определяем путь к TensorRT
+    if [[ -d "/opt/tensorrt" ]]; then
+        export TENSORRT_DIR="/opt/tensorrt"
+        export CPLUS_INCLUDE_PATH="$TENSORRT_DIR/include:${CPLUS_INCLUDE_PATH:-}"
+        export LIBRARY_PATH="$TENSORRT_DIR/lib:${LIBRARY_PATH:-}"
+        export LD_LIBRARY_PATH="$TENSORRT_DIR/lib:${LD_LIBRARY_PATH:-}"
+        log "TensorRT найден: $TENSORRT_DIR"
+    else
+        log "TensorRT системный (через apt)"
+    fi
 fi
 
-log "Virtual env: $VIRTUAL_ENV ✓"
+# ── Клонирование репозитория ─────────────────────────────────────────────────
+log "Клонирование vs-mlrt..."
 
-# ── Базовые проверки ─────────────────────────────────────────────────────────
-command -v nvidia-smi &>/dev/null || err "NVIDIA driver не найден"
-command -v python3    &>/dev/null || err "Python 3 не найден"
-command -v ffmpeg     &>/dev/null || err "ffmpeg не найден"
-
-CUDA_VER=$(nvidia-smi 2>/dev/null | grep -oP "CUDA Version: \K[\d.]+" || true)
-log "CUDA: ${CUDA_VER:-неизвестна}"
-
-# ── Python-пакеты ────────────────────────────────────────────────────────────
-log "Установка Python-пакетов..."
-pip install -q --upgrade pip wheel setuptools
-pip install -q numpy tqdm rich opencv-python Cython 'scenedetect[opencv]'
-
-# ── VapourSynth ──────────────────────────────────────────────────────────────
-log "Проверка VapourSynth..."
-if python3 -c "import vapoursynth as vs; print('VapourSynth:', vs.__version__)" 2>/dev/null; then
-    log "✓ VapourSynth: $(python3 -c 'import vapoursynth; print(vapoursynth.__version__)')"
+if [[ -d "$BUILD_DIR" ]]; then
+    log "Директория существует, обновляем..."
+    cd "$BUILD_DIR"
+    git pull
+    git submodule update --init --recursive
 else
-    err "VapourSynth не установлен. Запусти:\n  sudo apt install vapoursynth python3-vapoursynth libvapoursynth-dev"
+    git clone --recursive https://github.com/AmusementClub/vs-mlrt.git "$BUILD_DIR"
+    cd "$BUILD_DIR"
 fi
 
-# Определяем директорию плагинов VS
-VS_PLUGINS_DIR=$(python3 -c "
-import vapoursynth as vs
-import os
-# Пробуем разные пути
-paths = [
-    os.path.expanduser('~/.local/lib/vapoursynth'),
-    '/usr/lib/x86_64-linux-gnu/vapoursynth',
-    '/usr/local/lib/vapoursynth'
-]
-for p in paths:
-    if os.path.exists(p) or p == paths[0]:
-        print(p)
-        break
-" 2>/dev/null || echo "$HOME/.local/lib/vapoursynth")
+# ── Компиляция ───────────────────────────────────────────────────────────────
+log "Компиляция vs-mlrt (бэкенд: $BACKEND)..."
 
+rm -rf build
+mkdir build && cd build
+
+# Настройка cmake в зависимости от бэкенда
+case "$BACKEND" in
+    TRT)
+        CMAKE_FLAGS="-DWHICH_BACKEND=TRT"
+        
+        # Явно указываем пути к TensorRT если он в /opt
+        if [[ -n "${TENSORRT_DIR:-}" ]]; then
+            CMAKE_FLAGS="$CMAKE_FLAGS \
+                -DTENSORRT_ROOT=$TENSORRT_DIR \
+                -DCMAKE_PREFIX_PATH=$TENSORRT_DIR"
+        fi
+        ;;
+    NCNN)
+        CMAKE_FLAGS="-DWHICH_BACKEND=NCNN"
+        log "NCNN требует установки Vulkan SDK"
+        ;;
+    ORT)
+        CMAKE_FLAGS="-DWHICH_BACKEND=ORT"
+        log "ONNX Runtime потребуется скачать отдельно"
+        ;;
+    OV)
+        CMAKE_FLAGS="-DWHICH_BACKEND=OV"
+        log "OpenVINO нужно установить заранее"
+        ;;
+    *)
+        err "Неизвестный бэкенд: $BACKEND"
+        ;;
+esac
+
+log "CMake flags: $CMAKE_FLAGS"
+
+cmake -G Ninja \
+    $CMAKE_FLAGS \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX=/usr/local \
+    .. || err "CMake конфигурация не удалась"
+
+ninja -v || err "Компиляция не удалась"
+
+log "✓ Компиляция успешна"
+
+# ── Установка ────────────────────────────────────────────────────────────────
+log "Установка плагина..."
+
+# Находим скомпилированный .so файл
+SO_FILE=$(find . -name "libvs_mlrt*.so" -o -name "libvstrt.so" | head -1)
+
+if [[ -z "$SO_FILE" || ! -f "$SO_FILE" ]]; then
+    err "Скомпилированный .so файл не найден!"
+fi
+
+log "Найден плагин: $SO_FILE"
+
+# Копируем в директорию плагинов
 mkdir -p "$VS_PLUGINS_DIR"
-log "Директория плагинов VS: $VS_PLUGINS_DIR"
+cp -v "$SO_FILE" "$VS_PLUGINS_DIR/"
 
-# ── vsrepo ───────────────────────────────────────────────────────────────────
-log "Установка vsrepo..."
-pip install -q vsrepo
+log "✓ Плагин установлен в: $VS_PLUGINS_DIR"
 
-log "Обновление базы vsrepo..."
-if python3 -m vsrepo update 2>&1 | grep -q "successfully"; then
-    log "✓ База vsrepo обновлена"
-    VSREPO_OK=1
+# ── Установка Python-скрипта ─────────────────────────────────────────────────
+log "Установка Python API vsmlrt..."
+
+SCRIPTS_DIR="$BUILD_DIR/scripts"
+if [[ -d "$SCRIPTS_DIR" ]]; then
+    # Копируем в site-packages виртуального окружения
+    if [[ -n "${VIRTUAL_ENV:-}" ]]; then
+        SITE_PACKAGES="$VIRTUAL_ENV/lib/python$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')/site-packages"
+        mkdir -p "$SITE_PACKAGES"
+        
+        # Копируем все .py файлы
+        cp -v "$SCRIPTS_DIR"/*.py "$SITE_PACKAGES/" 2>/dev/null || \
+            log "  Нет .py файлов в $SCRIPTS_DIR"
+        
+        log "✓ Python API установлен в: $SITE_PACKAGES"
+    else
+        log "⚠️  Виртуальное окружение не активировано"
+    fi
 else
-    log "⚠️  vsrepo update не удался (будем устанавливать плагины вручную)"
-    VSREPO_OK=0
+    log "⚠️  Директория scripts/ не найдена"
 fi
 
-# ── vs-mlrt (TensorRT inference плагин) ──────────────────────────────────────
-log "Установка vs-mlrt..."
+# ── Скачивание моделей ───────────────────────────────────────────────────────
+log "Скачивание предобученных моделей..."
 
-# Пробуем через vsrepo
-if [[ $VSREPO_OK -eq 1 ]] && python3 -m vsrepo install mlrt 2>&1 | grep -qE "(Successfully|already installed)"; then
-    log "✓ vs-mlrt установлен через vsrepo"
+MODELS_DIR="$HOME/legendary-potato/models/vsmlrt"
+mkdir -p "$MODELS_DIR"
+
+# Находим последний релиз с моделями
+LATEST_RELEASE=$(curl -s https://api.github.com/repos/AmusementClub/vs-mlrt/releases/latest | grep -oP '"tag_name": "\K(.*)(?=")')
+MODELS_URL="https://github.com/AmusementClub/vs-mlrt/releases/download/$LATEST_RELEASE/models.7z"
+
+log "Последний релиз: $LATEST_RELEASE"
+
+if command -v 7z &>/dev/null || command -v 7za &>/dev/null; then
+    log "Скачивание models.7z..."
+    wget -q --show-progress -O "$MODELS_DIR/models.7z" "$MODELS_URL" || \
+        log "⚠️  Не удалось скачать модели"
+    
+    log "Распаковка моделей..."
+    cd "$MODELS_DIR"
+    7z x -y models.7z || 7za x -y models.7z || \
+        log "⚠️  Не удалось распаковать (установи p7zip: sudo apt install p7zip-full)"
+    
+    log "✓ Модели установлены в: $MODELS_DIR"
 else
-    log "  Установка vs-mlrt вручную..."
-    
-    # Определяем архитектуру и версию CUDA
-    ARCH="linux64"
-    CUDA_MAJOR=$(echo "$CUDA_VER" | cut -d. -f1)
-    
-    # URL для скачивания (CUDA 12.x)
-    if [[ "$CUDA_MAJOR" -ge 12 ]]; then
-        MLRT_URL="https://github.com/AmusementClub/vs-mlrt/releases/latest/download/vs-mlrt-cuda-${ARCH}.tar.gz"
-    else
-        MLRT_URL="https://github.com/AmusementClub/vs-mlrt/releases/download/v13/vs-mlrt-cuda11-${ARCH}.tar.gz"
-    fi
-    
-    TMP=$(mktemp -d)
-    
-    if wget -q --show-progress -O "$TMP/vsmlrt.tar.gz" "$MLRT_URL"; then
-        tar -xzf "$TMP/vsmlrt.tar.gz" -C "$TMP" 2>/dev/null || {
-            log "  Пробуем альтернативную распаковку..."
-            cd "$TMP" && tar -xzf vsmlrt.tar.gz
-        }
-        
-        # Копируем .so файлы
-        find "$TMP" -name "*.so" -exec cp -v {} "$VS_PLUGINS_DIR/" \; 2>/dev/null || {
-            log "  Нет .so файлов, копируем всё содержимое..."
-            cp -r "$TMP"/* "$VS_PLUGINS_DIR/" 2>/dev/null || true
-        }
-        
-        log "✓ vs-mlrt установлен в $VS_PLUGINS_DIR"
-    else
-        log "  ⚠️  Не удалось скачать vs-mlrt"
-        log "     Скачай вручную: $MLRT_URL"
-        log "     Распакуй .so файлы в: $VS_PLUGINS_DIR"
-    fi
-    
-    rm -rf "$TMP"
+    log "⚠️  7z не найден, скачай модели вручную:"
+    log "   $MODELS_URL"
+    log "   Распакуй в: $MODELS_DIR"
+    sudo apt install -y p7zip-full
 fi
 
-# Проверка vs-mlrt
-if python3 -c "
+# ── Проверка установки ───────────────────────────────────────────────────────
+log "Проверка установки..."
+
+python3 -c "
 import vapoursynth as vs
 core = vs.core
+
+# Проверяем доступность плагина
 try:
-    # Пробуем загрузить функции TensorRT
-    if hasattr(core, 'trt') or hasattr(core, 'ort'):
-        print('vs-mlrt доступен')
+    # Для TensorRT бэкенда
+    if hasattr(core, 'trt'):
+        print('✓ vs-mlrt (TRT) доступен в VapourSynth')
         exit(0)
-except:
-    pass
-exit(1)
-" 2>/dev/null; then
-    log "✓ vs-mlrt плагин загружается в VapourSynth"
-else
-    log "⚠️  vs-mlrt не загружается (не критично для сборки TensorRT engines)"
-fi
+    elif hasattr(core, 'ort'):
+        print('✓ vs-mlrt (ORT) доступен в VapourSynth')
+        exit(0)
+    elif hasattr(core, 'ncnn'):
+        print('✓ vs-mlrt (NCNN) доступен в VapourSynth')
+        exit(0)
+    else:
+        print('⚠️  vs-mlrt плагин не загрузился')
+        print('Доступные плагины:', dir(core))
+        exit(1)
+except Exception as e:
+    print('⚠️  Ошибка при проверке:', e)
+    exit(1)
+" || log "⚠️  Плагин не загружается (проверь пути)"
 
-# ── FFMS2 (источник видео) ───────────────────────────────────────────────────
-log "Установка ffms2..."
-if [[ $VSREPO_OK -eq 1 ]]; then
-    python3 -m vsrepo install ffms2 2>&1 | grep -qE "(Successfully|already)" && \
-        log "✓ ffms2 установлен" || log "  ffms2: установка через vsrepo не удалась"
-else
-    log "  ffms2: установи вручную или через apt (libffms2-dev)"
-fi
-
-# ── TensorRT ─────────────────────────────────────────────────────────────────
-log "Проверка TensorRT..."
-
-# Python API
-if python3 -c "import tensorrt; print('TensorRT Python:', tensorrt.__version__)" 2>/dev/null; then
-    log "✓ TensorRT Python API установлен"
-else
-    log "⚠️  TensorRT Python API не найден (не критично)"
-fi
-
-# trtexec (ОБЯЗАТЕЛЬНО для сборки engines)
-if command -v trtexec &>/dev/null; then
-    log "✓ trtexec: $(which trtexec)"
-    trtexec --version 2>&1 | head -1 | sed 's/^/  /'
-else
-    log "❌ trtexec не найден!"
-    log "   Запусти для установки: ./setup/install_tensorrt_tarball.sh"
-fi
-
-# ── ffmpeg с vid.stab ────────────────────────────────────────────────────────
-log "Проверка vid.stab..."
-if ffmpeg -filters 2>&1 | grep -q vidstabdetect; then
-    log "✓ vid.stab доступен в ffmpeg"
-else
-    log "⚠️  vid.stab не найден, устанавливаем..."
-    
-    if ! grep -qr "savoury1/ffmpeg" /etc/apt/sources.list.d/ 2>/dev/null; then
-        sudo add-apt-repository -y ppa:savoury1/ffmpeg5 || \
-            sudo add-apt-repository -y ppa:savoury1/ffmpeg4
-        sudo apt update
-    fi
-    
-    sudo apt install -y ffmpeg
-    
-    if ffmpeg -filters 2>&1 | grep -q vidstabdetect; then
-        log "✓ vid.stab установлен"
-    else
-        log "⚠️  vid.stab всё ещё недоступен (собери ffmpeg вручную)"
-    fi
-fi
-
-# ── Дополнительные утилиты ───────────────────────────────────────────────────
-log "Установка вспомогательных инструментов..."
-sudo apt install -y libimage-exiftool-perl mediainfo 2>/dev/null || true
-
-# ── Итоговая диагностика ─────────────────────────────────────────────────────
+# ── Итоги ────────────────────────────────────────────────────────────────────
 log ""
 log "═══════════════════════════════════════════════════════════════"
-log "  ✅ Установка завершена"
+log "  ✅ vs-mlrt собран и установлен"
 log ""
-log "  Установленные компоненты:"
-python3 -c "import vapoursynth; print('  ✓ VapourSynth:', vapoursynth.__version__)"
-python3 -c "import scenedetect; print('  ✓ PySceneDetect:', scenedetect.__version__)"
-python3 -c "import cv2; print('  ✓ OpenCV:', cv2.__version__)"
-python3 -c "import tensorrt; print('  ✓ TensorRT Python:', tensorrt.__version__)" 2>/dev/null || echo "  ⚠️  TensorRT Python API"
-
-if command -v trtexec &>/dev/null; then
-    echo "  ✓ trtexec: $(which trtexec)"
-else
-    echo "  ❌ trtexec НЕ УСТАНОВЛЕН (запусти install_tensorrt_tarball.sh)"
-fi
-
-if ffmpeg -filters 2>&1 | grep -q vidstabdetect; then
-    echo "  ✓ ffmpeg vid.stab"
-else
-    echo "  ⚠️  ffmpeg vid.stab"
-fi
-
+log "  📂 Плагин: $VS_PLUGINS_DIR/$(basename $SO_FILE)"
+log "  📂 Модели: $MODELS_DIR"
 log ""
-log "  Плагины VapourSynth в: $VS_PLUGINS_DIR"
-ls -1 "$VS_PLUGINS_DIR"/*.so 2>/dev/null | sed 's|.*/|  - |' || echo "  (нет .so файлов)"
+log "  Использование в VapourSynth скрипте:"
+log "    import vapoursynth as vs"
+log "    core = vs.core"
+log "    core.trt.Model(clip, 'path/to/model.onnx')"
 log ""
-
-if command -v trtexec &>/dev/null; then
-    log "  🎯 Готов к сборке engines: ./setup/02_build_trt_engines.sh"
-else
-    log "  ⚠️  Сначала установи TensorRT: ./setup/install_tensorrt_tarball.sh"
-fi
-
+log "  Следующий шаг: ./setup/02_build_trt_engines.sh"
 log "═══════════════════════════════════════════════════════════════"
