@@ -1,187 +1,65 @@
-#!/usr/bin/env bash
-# setup/01_setup_env.sh - ИСПРАВЛЕННАЯ ВЕРСИЯ
-set -euo pipefail
-
-log() { echo -e "\033[1;32m[setup]\033[0m $*"; }
-err() { echo -e "\033[1;31m[ERROR]\033[0m $*" >&2; exit 1; }
-
-# ── Проверка виртуального окружения ──────────────────────────────────────────
-if [[ -z "${VIRTUAL_ENV:-}" ]]; then
-    err "Запусти из venv:\n  source venv/bin/activate"
-fi
-
-log "Virtual env: $VIRTUAL_ENV ✓"
-
-# ── Проверки базовых зависимостей ────────────────────────────────────────────
-command -v nvidia-smi &>/dev/null || err "NVIDIA driver не найден"
-command -v python3    &>/dev/null || err "Python 3 не найден"
-command -v ffmpeg     &>/dev/null || err "ffmpeg не найден: sudo apt install ffmpeg"
-
-CUDA_VER=$(nvidia-smi 2>/dev/null | grep -oP "CUDA Version: \K[\d.]+" || true)
-log "CUDA: ${CUDA_VER:-"неизвестна"}"
-
-# ── Python-пакеты ────────────────────────────────────────────────────────────
-log "Установка Python-пакетов..."
-pip install --upgrade pip wheel setuptools
-pip install \
-    numpy \
-    tqdm \
-    rich \
-    opencv-python \
-    Cython \
-    'scenedetect[opencv]'
-
-# ── VapourSynth ──────────────────────────────────────────────────────────────
-log "Проверка VapourSynth..."
-if ! python3 -c "import vapoursynth" 2>/dev/null; then
-    log "Установка VapourSynth через apt..."
-    if ! grep -q "djcj/vapoursynth" /etc/apt/sources.list.d/*.list 2>/dev/null; then
-        sudo add-apt-repository -y ppa:djcj/vapoursynth
-        sudo apt update
-    fi
-    sudo apt install -y vapoursynth python3-vapoursynth libvapoursynth-dev
-fi
-
-python3 -c "import vapoursynth; print('VapourSynth:', vapoursynth.__version__)" || \
-    err "VapourSynth не установлен"
-
-VS_PLUGIN_DIR=$(python3 -c "import vapoursynth as vs; print(vs.core.plugins())" 2>/dev/null | grep -oP "(?<=').*(?=')" | head -1 || echo "$HOME/.local/lib/vapoursynth")
-log "VS plugin dir: $VS_PLUGIN_DIR"
-
-# ── vsrepo (обновление базы плагинов) ────────────────────────────────────────
-log "Установка vsrepo..."
-pip install vsrepo
-
-log "Обновление базы плагинов vsrepo..."
-python3 -m vsrepo update || {
-    log "  vsrepo update не удался, пробуем инициализацию вручную..."
-    mkdir -p ~/.config/vsrepo
-    python3 -m vsrepo upgrade-all 2>/dev/null || log "  (пропускаем)"
-}
-
-# Проверяем успешность обновления
-if python3 -m vsrepo available 2>&1 | grep -q "ffms2"; then
-    log "✓ База плагинов vsrepo обновлена"
-    VSREPO_OK=1
-else
-    log "⚠️  vsrepo не работает корректно, будем устанавливать плагины вручную"
-    VSREPO_OK=0
-fi
-
-# ── Установка плагинов VapourSynth ───────────────────────────────────────────
-if [[ $VSREPO_OK -eq 1 ]]; then
-    log "Установка плагинов через vsrepo..."
-    python3 -m vsrepo install ffms2 || log "  ffms2: пропускаем"
-    python3 -m vsrepo install bm3dcuda || log "  bm3dcuda: не найден в репозитории"
-    python3 -m vsrepo install rife || log "  rife: не найден в репозитории"
-else
-    log "Установка плагинов вручную (vsrepo недоступен)..."
-fi
-
-# ── vs-mlrt (TensorRT inference для VapourSynth) ─────────────────────────────
-log "Установка vs-mlrt..."
-
-# Устанавливаем Python-обёртку
-pip install vsmlrt || {
-    log "  Установка vsmlrt через pip не удалась, пробуем из исходников..."
-    pip install git+https://github.com/AmusementClub/vs-mlrt.git || \
-        log "  ⚠️  vsmlrt Python package не установлен"
-}
-
-# Устанавливаем бинарный плагин
-if [[ $VSREPO_OK -eq 1 ]]; then
-    python3 -m vsrepo install mlrt || {
-        log "  vs-mlrt плагин не найден через vsrepo, устанавливаем вручную..."
-        install_vsmlrt_manual
-    }
-else
-    install_vsmlrt_manual
-fi
-
-# Функция ручной установки vs-mlrt
-install_vsmlrt_manual() {
-    local MLRT_RELEASE="https://github.com/AmusementClub/vs-mlrt/releases/latest/download/vs-mlrt-cuda-linux64.tar.gz"
-    local TMP_DIR=$(mktemp -d)
-    
-    log "  Скачивание vs-mlrt..."
-    wget -q -O "$TMP_DIR/vsmlrt.tar.gz" "$MLRT_RELEASE" || {
-        log "  ⚠️  Не удалось скачать vs-mlrt"
-        return 1
-    }
-    
-    tar -xzf "$TMP_DIR/vsmlrt.tar.gz" -C "$TMP_DIR"
-    
-    # Копируем плагины
-    mkdir -p "$VS_PLUGIN_DIR"
-    cp -v "$TMP_DIR"/*.so "$VS_PLUGIN_DIR/" 2>/dev/null || {
-        log "  Копирование в $VS_PLUGIN_DIR не удалось, пробуем ~/.local/lib/vapoursynth/"
-        mkdir -p ~/.local/lib/vapoursynth
-        cp -v "$TMP_DIR"/*.so ~/.local/lib/vapoursynth/
-    }
-    
-    rm -rf "$TMP_DIR"
-    log "  ✓ vs-mlrt установлен вручную"
-}
-
-# Проверка установки vs-mlrt
-python3 -c "from vsmlrt import Backend; print('vsmlrt:', Backend)" 2>/dev/null && \
-    log "✓ vsmlrt Python API работает" || \
-    log "⚠️  vsmlrt Python API не импортируется (проверь установку)"
-
-# ── TensorRT ─────────────────────────────────────────────────────────────────
-log "Проверка TensorRT..."
-if python3 -c "import tensorrt; print('TensorRT:', tensorrt.__version__)" 2>/dev/null; then
-    log "✓ TensorRT Python API установлен"
-else
-    log "Установка TensorRT..."
-    pip install tensorrt --extra-index-url https://pypi.nvidia.com || \
-        log "⚠️  TensorRT: установи вручную через ./setup/install_tensorrt_tarball.sh"
-fi
-
-# ── ffmpeg с vid.stab ────────────────────────────────────────────────────────
-log "Проверка vid.stab..."
-if ! ffmpeg -filters 2>&1 | grep -q vidstabdetect; then
-    log "Установка ffmpeg с vid.stab..."
-    
-    if ! grep -q "savoury1/ffmpeg" /etc/apt/sources.list.d/*.list 2>/dev/null; then
-        sudo add-apt-repository -y ppa:savoury1/ffmpeg4 || \
-            sudo add-apt-repository -y ppa:savoury1/ffmpeg5
-        sudo apt update
-    fi
-    
-    sudo apt install -y ffmpeg
-    
-    # Проверка после установки
-    if ffmpeg -filters 2>&1 | grep -q vidstabdetect; then
-        log "✓ vid.stab установлен"
-    else
-        log "⚠️  vid.stab всё ещё отсутствует (собери ffmpeg вручную)"
-    fi
-else
-    log "✓ vid.stab найден в ffmpeg"
-fi
-
-# ── Дополнительные утилиты ───────────────────────────────────────────────────
-log "Установка вспомогательных инструментов..."
-sudo apt install -y libimage-exiftool-perl mediainfo 2>/dev/null || true
-
-# ── Gyroflow (опционально) ───────────────────────────────────────────────────
-if ! command -v gyroflow &>/dev/null; then
-    log "Gyroflow не найден (опционально)"
-    log "  Скачай с https://gyroflow.xyz/download для продвинутой стабилизации"
-fi
-
-# ── Финальная проверка ───────────────────────────────────────────────────────
-log ""
-log "═══════════════════════════════════════════════════════════════"
-log "  ✅ Установка завершена"
-log ""
-log "  Проверка компонентов:"
-python3 -c "import vapoursynth as vs; print('  ✓ VapourSynth:', vs.__version__)"
-python3 -c "import scenedetect; print('  ✓ SceneDetect:', scenedetect.__version__)"
-python3 -c "import tensorrt; print('  ✓ TensorRT:', tensorrt.__version__)" 2>/dev/null || echo "  ⚠️  TensorRT Python API не установлен"
-python3 -c "from vsmlrt import Backend; print('  ✓ vsmlrt')" 2>/dev/null || echo "  ⚠️  vsmlrt не установлен"
-command -v trtexec &>/dev/null && echo "  ✓ trtexec: $(which trtexec)" || echo "  ⚠️  trtexec не найден"
-log ""
-log "  Следующий шаг: ./setup/02_build_trt_engines.sh"
-log "═══════════════════════════════════════════════════════════════"
+(venv) makleso6@makleso6:~/legendary-potato$ ./setup/01_setup_env.sh 
+[setup] Virtual env: /home/makleso6/legendary-potato/venv ✓
+[setup] CUDA: 13.0
+[setup] Установка Python-пакетов...
+Requirement already satisfied: pip in ./venv/lib/python3.12/site-packages (26.0.1)
+Collecting wheel
+  Using cached wheel-0.46.3-py3-none-any.whl.metadata (2.4 kB)
+Collecting setuptools
+  Using cached setuptools-82.0.1-py3-none-any.whl.metadata (6.5 kB)
+Collecting packaging>=24.0 (from wheel)
+  Using cached packaging-26.0-py3-none-any.whl.metadata (3.3 kB)
+Using cached wheel-0.46.3-py3-none-any.whl (30 kB)
+Using cached setuptools-82.0.1-py3-none-any.whl (1.0 MB)
+Using cached packaging-26.0-py3-none-any.whl (74 kB)
+Installing collected packages: setuptools, packaging, wheel
+Successfully installed packaging-26.0 setuptools-82.0.1 wheel-0.46.3
+Requirement already satisfied: numpy in ./venv/lib/python3.12/site-packages (2.4.4)
+Requirement already satisfied: tqdm in ./venv/lib/python3.12/site-packages (4.67.3)
+Requirement already satisfied: rich in ./venv/lib/python3.12/site-packages (14.3.3)
+Requirement already satisfied: opencv-python in ./venv/lib/python3.12/site-packages (4.13.0.92)
+Collecting Cython
+  Using cached cython-3.2.4-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl.metadata (7.5 kB)
+Requirement already satisfied: scenedetect[opencv] in ./venv/lib/python3.12/site-packages (0.6.7.1)
+Requirement already satisfied: markdown-it-py>=2.2.0 in ./venv/lib/python3.12/site-packages (from rich) (4.0.0)
+Requirement already satisfied: pygments<3.0.0,>=2.13.0 in ./venv/lib/python3.12/site-packages (from rich) (2.20.0)
+Requirement already satisfied: click<8.3.0,~=8.0 in ./venv/lib/python3.12/site-packages (from scenedetect[opencv]) (8.2.1)
+Requirement already satisfied: platformdirs in ./venv/lib/python3.12/site-packages (from scenedetect[opencv]) (4.9.4)
+Requirement already satisfied: mdurl~=0.1 in ./venv/lib/python3.12/site-packages (from markdown-it-py>=2.2.0->rich) (0.1.2)
+Using cached cython-3.2.4-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl (3.4 MB)
+Installing collected packages: Cython
+Successfully installed Cython-3.2.4
+[setup] Проверка VapourSynth...
+VapourSynth: R74
+[setup] VS plugin dir: /home/makleso6/.local/lib/vapoursynth
+[setup] Установка vsrepo...
+Requirement already satisfied: vsrepo in ./venv/lib/python3.12/site-packages (1.0.0)
+Requirement already satisfied: vapoursynth>=74rc1 in ./venv/lib/python3.12/site-packages (from vsrepo) (74rc2)
+Requirement already satisfied: vsstubs>=1.1.2 in ./venv/lib/python3.12/site-packages (from vsrepo) (1.2.0)
+Requirement already satisfied: tqdm in ./venv/lib/python3.12/site-packages (from vsrepo) (4.67.3)
+Requirement already satisfied: rich>=14.3.0 in ./venv/lib/python3.12/site-packages (from vsstubs>=1.1.2->vsrepo) (14.3.3)
+Requirement already satisfied: typer>=0.24.0 in ./venv/lib/python3.12/site-packages (from vsstubs>=1.1.2->vsrepo) (0.24.1)
+Requirement already satisfied: typing-extensions>=4.15.0 in ./venv/lib/python3.12/site-packages (from vsstubs>=1.1.2->vsrepo) (4.15.0)
+Requirement already satisfied: markdown-it-py>=2.2.0 in ./venv/lib/python3.12/site-packages (from rich>=14.3.0->vsstubs>=1.1.2->vsrepo) (4.0.0)
+Requirement already satisfied: pygments<3.0.0,>=2.13.0 in ./venv/lib/python3.12/site-packages (from rich>=14.3.0->vsstubs>=1.1.2->vsrepo) (2.20.0)
+Requirement already satisfied: mdurl~=0.1 in ./venv/lib/python3.12/site-packages (from markdown-it-py>=2.2.0->rich>=14.3.0->vsstubs>=1.1.2->vsrepo) (0.1.2)
+Requirement already satisfied: click>=8.2.1 in ./venv/lib/python3.12/site-packages (from typer>=0.24.0->vsstubs>=1.1.2->vsrepo) (8.2.1)
+Requirement already satisfied: shellingham>=1.3.0 in ./venv/lib/python3.12/site-packages (from typer>=0.24.0->vsstubs>=1.1.2->vsrepo) (1.5.4)
+Requirement already satisfied: annotated-doc>=0.0.2 in ./venv/lib/python3.12/site-packages (from typer>=0.24.0->vsstubs>=1.1.2->vsrepo) (0.0.4)
+[setup] Обновление базы плагинов vsrepo...
+/home/makleso6/legendary-potato/venv/bin/python3: No module named vsrepo.__main__; 'vsrepo' is a package and cannot be directly executed
+[setup]   vsrepo update не удался, пробуем инициализацию вручную...
+[setup]   (пропускаем)
+[setup] ⚠️  vsrepo не работает корректно, будем устанавливать плагины вручную
+[setup] Установка плагинов вручную (vsrepo недоступен)...
+[setup] Установка vs-mlrt...
+ERROR: Could not find a version that satisfies the requirement vsmlrt (from versions: none)
+ERROR: No matching distribution found for vsmlrt
+[setup]   Установка vsmlrt через pip не удалась, пробуем из исходников...
+Collecting git+https://github.com/AmusementClub/vs-mlrt.git
+  Cloning https://github.com/AmusementClub/vs-mlrt.git to /tmp/pip-req-build-mam4puk_
+  Running command git clone --filter=blob:none --quiet https://github.com/AmusementClub/vs-mlrt.git /tmp/pip-req-build-mam4puk_
+  Resolved https://github.com/AmusementClub/vs-mlrt.git to commit 885e8bb827fc431fce8e3109e7d60b0c38aa2035
+ERROR: git+https://github.com/AmusementClub/vs-mlrt.git does not appear to be a Python project: neither 'setup.py' nor 'pyproject.toml' found.
+[setup]   ⚠️  vsmlrt Python package не установлен
+./setup/01_setup_env.sh: строка 98: install_vsmlrt_manual: команда не найдена
