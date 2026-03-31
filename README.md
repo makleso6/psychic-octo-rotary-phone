@@ -1,452 +1,243 @@
-cat > setup/diagnose.sh <<'SCRIPT'
-#!/usr/bin/env bash
-# setup/diagnose.sh - Полная диагностика окружения для concert video enhancement
-set -u
-
-# Цвета
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
-
-print_header() {
-    echo -e "\n${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${BLUE}  $1${NC}"
-    echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-}
-
-check_ok() {
-    echo -e "${GREEN}✓${NC} $1"
-}
-
-check_warn() {
-    echo -e "${YELLOW}⚠${NC} $1"
-}
-
-check_fail() {
-    echo -e "${RED}✗${NC} $1"
-}
-
-run_cmd() {
-    echo -e "${BLUE}$${NC} $1"
-    eval "$1" 2>&1 | sed 's/^/  /'
-}
-
-# ══════════════════════════════════════════════════════════════════════════════
-# СИСТЕМНАЯ ИНФОРМАЦИЯ
-# ══════════════════════════════════════════════════════════════════════════════
-
-print_header "СИСТЕМНАЯ ИНФОРМАЦИЯ"
-
-echo "Дистрибутив:"
-if [ -f /etc/os-release ]; then
-    source /etc/os-release
-    echo "  $PRETTY_NAME"
-    echo "  Версия: $VERSION_ID"
-else
-    echo "  Неизвестно"
-fi
-
-echo ""
-echo "Ядро:"
-uname -r
-
-echo ""
-echo "Архитектура:"
-uname -m
-
-echo ""
-echo "Дата и время:"
-date
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PYTHON ОКРУЖЕНИЕ
-# ══════════════════════════════════════════════════════════════════════════════
-
-print_header "PYTHON ОКРУЖЕНИЕ"
-
-if [ -n "${VIRTUAL_ENV:-}" ]; then
-    check_ok "Виртуальное окружение активно: $VIRTUAL_ENV"
-else
-    check_warn "Виртуальное окружение НЕ активно"
-fi
-
-echo ""
-echo "Python версия:"
-if command -v python3 &>/dev/null; then
-    python3 --version
-    echo "  Путь: $(which python3)"
-else
-    check_fail "python3 не найден"
-fi
-
-echo ""
-echo "pip версия:"
-if command -v pip3 &>/dev/null || command -v pip &>/dev/null; then
-    pip --version 2>/dev/null || pip3 --version
-else
-    check_fail "pip не найден"
-fi
-
-echo ""
-echo "Установленные Python пакеты (основные):"
-for pkg in numpy opencv-python tqdm rich scenedetect vapoursynth tensorrt vsrepo; do
-    if python3 -c "import $pkg" 2>/dev/null; then
-        version=$(python3 -c "import $pkg; print(getattr($pkg, '__version__', 'unknown'))" 2>/dev/null)
-        check_ok "$pkg: $version"
-    else
-        check_fail "$pkg не установлен"
-    fi
-done
-
-# ══════════════════════════════════════════════════════════════════════════════
-# NVIDIA / CUDA
-# ══════════════════════════════════════════════════════════════════════════════
-
-print_header "NVIDIA / CUDA"
-
-if command -v nvidia-smi &>/dev/null; then
-    check_ok "nvidia-smi найден"
-    echo ""
-    run_cmd "nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader"
-    echo ""
-    echo "CUDA версия из драйвера:"
-    nvidia-smi | grep "CUDA Version" | awk '{print "  "$9}'
-else
-    check_fail "nvidia-smi не найден (NVIDIA драйвер не установлен)"
-fi
-
-echo ""
-if command -v nvcc &>/dev/null; then
-    check_ok "nvcc (CUDA Toolkit) найден"
-    nvcc --version | grep "release" | awk '{print "  Версия: "$5}'
-else
-    check_warn "nvcc не найден (CUDA Toolkit не установлен)"
-fi
-
-# ══════════════════════════════════════════════════════════════════════════════
-# TENSORRT
-# ══════════════════════════════════════════════════════════════════════════════
-
-print_header "TENSORRT"
-
-# trtexec
-if command -v trtexec &>/dev/null; then
-    check_ok "trtexec найден: $(which trtexec)"
-    echo ""
-    run_cmd "trtexec --version 2>&1 | head -3"
-else
-    check_fail "trtexec НЕ НАЙДЕН (критично для сборки engines)"
-fi
-
-echo ""
-# TensorRT библиотеки
-echo "Поиск libnvinfer.so:"
-LIBNVINFER=$(find /usr /opt -name "libnvinfer.so*" 2>/dev/null | head -5)
-if [ -n "$LIBNVINFER" ]; then
-    echo "$LIBNVINFER" | while read line; do
-        check_ok "$line"
-    done
-else
-    check_fail "libnvinfer.so не найден"
-fi
-
-echo ""
-# Python API
-if python3 -c "import tensorrt" 2>/dev/null; then
-    TRT_VER=$(python3 -c "import tensorrt; print(tensorrt.__version__)" 2>/dev/null)
-    check_ok "TensorRT Python API: $TRT_VER"
-else
-    check_warn "TensorRT Python API не установлен (не критично)"
-fi
-
-echo ""
-# TensorRT директория
-if [ -d "/opt/tensorrt" ]; then
-    check_ok "TensorRT директория: /opt/tensorrt"
-    echo "  Содержимое:"
-    ls -la /opt/tensorrt/ 2>/dev/null | head -10 | sed 's/^/    /'
-fi
-
-# ══════════════════════════════════════════════════════════════════════════════
-# VAPOURSYNTH
-# ══════════════════════════════════════════════════════════════════════════════
-
-print_header "VAPOURSYNTH"
-
-if python3 -c "import vapoursynth" 2>/dev/null; then
-    VS_VER=$(python3 -c "import vapoursynth; print(vapoursynth.__version__)" 2>/dev/null)
-    check_ok "VapourSynth: $VS_VER"
-else
-    check_fail "VapourSynth не установлен"
-fi
-
-echo ""
-echo "Поиск vapoursynth библиотек:"
-find /usr -name "libvapoursynth.so*" 2>/dev/null | head -3 | while read line; do
-    echo "  $line"
-done
-
-echo ""
-echo "Директории плагинов VapourSynth:"
-VS_PLUGIN_DIRS=(
-    "$HOME/.local/lib/vapoursynth"
-    "/usr/lib/x86_64-linux-gnu/vapoursynth"
-    "/usr/local/lib/vapoursynth"
-)
-
-for dir in "${VS_PLUGIN_DIRS[@]}"; do
-    if [ -d "$dir" ]; then
-        check_ok "$dir"
-        echo "  Плагины (.so):"
-        ls -1 "$dir"/*.so 2>/dev/null | xargs -n1 basename | sed 's/^/    - /' || echo "    (нет .so файлов)"
-    else
-        check_warn "$dir не существует"
-    fi
-done
-
-echo ""
-echo "Тест загрузки плагинов в VapourSynth:"
-python3 <<'PYEOF'
-import vapoursynth as vs
-core = vs.core
-
-print(f"  VapourSynth API: {vs.API_VERSION}")
-print(f"  Число потоков: {core.num_threads}")
-print(f"\n  Загруженные плагины:")
-
-# Попытка вызвать core.plugins() (API v4) или перебор атрибутов
-try:
-    plugins = core.plugins()
-    for p in plugins:
-        print(f"    - {p}")
-except:
-    # Альтернативный способ для старых версий
-    attrs = [x for x in dir(core) if not x.startswith('_')]
-    for attr in attrs[:20]:  # первые 20
-        print(f"    - {attr}")
-
-# Проверка конкретных плагинов
-checks = {
-    'ffms2': 'core.ffms2',
-    'trt': 'core.trt',
-    'ort': 'core.ort',
-    'bm3d': 'core.bm3d',
-    'rife': 'core.rife'
-}
-
-print(f"\n  Проверка специфичных плагинов:")
-for name, attr_path in checks.items():
-    try:
-        exec(f"_ = {attr_path}")
-        print(f"    ✓ {name} доступен")
-    except:
-        print(f"    ✗ {name} недоступен")
-PYEOF
-
-# ══════════════════════════════════════════════════════════════════════════════
-# FFMPEG
-# ══════════════════════════════════════════════════════════════════════════════
-
-print_header "FFMPEG"
-
-if command -v ffmpeg &>/dev/null; then
-    check_ok "ffmpeg найден: $(which ffmpeg)"
-    echo ""
-    run_cmd "ffmpeg -version | head -3"
-else
-    check_fail "ffmpeg не найден"
-fi
-
-echo ""
-echo "Проверка фильтров ffmpeg:"
-FILTERS=("vidstabdetect" "vidstabtransform" "scale_cuda" "scale_npp")
-for filter in "${FILTERS[@]}"; do
-    if ffmpeg -filters 2>&1 | grep -q "^.*$filter"; then
-        check_ok "$filter"
-    else
-        check_warn "$filter отсутствует"
-    fi
-done
-
-echo ""
-echo "Кодеки NVIDIA (nvenc):"
-if ffmpeg -codecs 2>&1 | grep -q "h264_nvenc"; then
-    check_ok "h264_nvenc доступен"
-else
-    check_warn "h264_nvenc недоступен"
-fi
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ДОПОЛНИТЕЛЬНЫЕ УТИЛИТЫ
-# ══════════════════════════════════════════════════════════════════════════════
-
-print_header "ДОПОЛНИТЕЛЬНЫЕ УТИЛИТЫ"
-
-TOOLS=("exiftool" "mediainfo" "7z" "git" "cmake" "ninja" "wget" "curl")
-for tool in "${TOOLS[@]}"; do
-    if command -v "$tool" &>/dev/null; then
-        check_ok "$tool: $(which $tool)"
-    else
-        check_warn "$tool не найден"
-    fi
-done
-
-# ══════════════════════════════════════════════════════════════════════════════
-# СТРУКТУРА ПРОЕКТА
-# ══════════════════════════════════════════════════════════════════════════════
-
-print_header "СТРУКТУРА ПРОЕКТА"
-
-PROJECT_ROOT="$HOME/legendary-potato"
-if [ -d "$PROJECT_ROOT" ]; then
-    check_ok "Директория проекта: $PROJECT_ROOT"
-    echo ""
-    echo "Содержимое:"
-    ls -la "$PROJECT_ROOT" | sed 's/^/  /'
-    
-    echo ""
-    echo "Директория setup/:"
-    if [ -d "$PROJECT_ROOT/setup" ]; then
-        ls -la "$PROJECT_ROOT/setup" | sed 's/^/  /'
-    else
-        check_warn "setup/ не существует"
-    fi
-    
-    echo ""
-    echo "Директория models/:"
-    if [ -d "$PROJECT_ROOT/models" ]; then
-        echo "  ONNX модели:"
-        ls -lh "$PROJECT_ROOT/models/onnx"/*.onnx 2>/dev/null | awk '{print "    "$9" ("$5")"}' || echo "    (нет .onnx файлов)"
-        echo "  TensorRT engines:"
-        ls -lh "$PROJECT_ROOT/models/engines"/*.engine 2>/dev/null | awk '{print "    "$9" ("$5")"}' || echo "    (нет .engine файлов)"
-    else
-        check_warn "models/ не существует"
-    fi
-else
-    check_fail "Директория проекта не найдена: $PROJECT_ROOT"
-fi
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ
-# ══════════════════════════════════════════════════════════════════════════════
-
-print_header "ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ"
-
-ENVS=("PATH" "LD_LIBRARY_PATH" "PYTHONPATH" "CUDA_HOME" "TENSORRT_DIR" "VIRTUAL_ENV")
-for env in "${ENVS[@]}"; do
-    if [ -n "${!env:-}" ]; then
-        echo "$env:"
-        echo "${!env}" | tr ':' '\n' | sed 's/^/  /'
-    else
-        check_warn "$env не установлена"
-    fi
-    echo ""
-done
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ИТОГОВАЯ СВОДКА
-# ══════════════════════════════════════════════════════════════════════════════
-
-print_header "ИТОГОВАЯ СВОДКА"
-
-echo "Критичные компоненты:"
-CRITICAL=0
-
-if command -v python3 &>/dev/null; then
-    check_ok "Python 3"
-else
-    check_fail "Python 3"
-    CRITICAL=$((CRITICAL+1))
-fi
-
-if [ -n "${VIRTUAL_ENV:-}" ]; then
-    check_ok "Virtual environment"
-else
-    check_warn "Virtual environment (рекомендуется)"
-fi
-
-if command -v nvidia-smi &>/dev/null; then
-    check_ok "NVIDIA драйвер"
-else
-    check_fail "NVIDIA драйвер"
-    CRITICAL=$((CRITICAL+1))
-fi
-
-if command -v trtexec &>/dev/null; then
-    check_ok "trtexec (TensorRT)"
-else
-    check_fail "trtexec (TensorRT) - НЕОБХОДИМ ДЛЯ СБОРКИ ENGINES"
-    CRITICAL=$((CRITICAL+1))
-fi
-
-if python3 -c "import vapoursynth" 2>/dev/null; then
-    check_ok "VapourSynth"
-else
-    check_fail "VapourSynth"
-    CRITICAL=$((CRITICAL+1))
-fi
-
-if command -v ffmpeg &>/dev/null; then
-    check_ok "ffmpeg"
-else
-    check_fail "ffmpeg"
-    CRITICAL=$((CRITICAL+1))
-fi
-
-if python3 -c "import scenedetect" 2>/dev/null; then
-    check_ok "PySceneDetect"
-else
-    check_warn "PySceneDetect (необязательно)"
-fi
-
-echo ""
-echo "Опциональные компоненты:"
-
-if ffmpeg -filters 2>&1 | grep -q vidstabdetect; then
-    check_ok "vid.stab (стабилизация)"
-else
-    check_warn "vid.stab (улучшит стабилизацию)"
-fi
-
-if python3 -c "from vsmlrt import Backend" 2>/dev/null; then
-    check_ok "vs-mlrt (inference через VapourSynth)"
-else
-    check_warn "vs-mlrt (для VapourSynth inference)"
-fi
-
-echo ""
-if [ $CRITICAL -eq 0 ]; then
-    echo -e "${GREEN}════════════════════════════════════════════════════════════${NC}"
-    echo -e "${GREEN}  ✓ ВСЕ КРИТИЧНЫЕ КОМПОНЕНТЫ УСТАНОВЛЕНЫ${NC}"
-    echo -e "${GREEN}════════════════════════════════════════════════════════════${NC}"
-    echo ""
-    echo "Готов к запуску: ./setup/02_build_trt_engines.sh"
-else
-    echo -e "${RED}════════════════════════════════════════════════════════════${NC}"
-    echo -e "${RED}  ✗ ОТСУТСТВУЮТ $CRITICAL КРИТИЧНЫХ КОМПОНЕНТА(-ОВ)${NC}"
-    echo -e "${RED}════════════════════════════════════════════════════════════${NC}"
-    echo ""
-    echo "Рекомендации:"
-    
-    if ! command -v trtexec &>/dev/null; then
-        echo "  1. Установи TensorRT: ./setup/install_tensorrt_tarball.sh"
-    fi
-    
-    if ! python3 -c "import vapoursynth" 2>/dev/null; then
-        echo "  2. Установи VapourSynth: sudo apt install vapoursynth python3-vapoursynth"
-    fi
-    
-    if ! command -v ffmpeg &>/dev/null; then
-        echo "  3. Установи ffmpeg: sudo apt install ffmpeg"
-    fi
-fi
-
-echo ""
-echo -e "${BLUE}════════════════════════════════════════════════════════════${NC}"
-echo "Сохрани вывод этого скрипта и отправь для анализа"
-echo -e "${BLUE}════════════════════════════════════════════════════════════${NC}"
-SCRIPT
-
-chmod +x setup/diagnose.sh
+(venv) makleso6@makleso6:~/legendary-potato$ ./setup/env.sh 
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  СИСТЕМНАЯ ИНФОРМАЦИЯ
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Дистрибутив:
+  Ubuntu 24.04.4 LTS
+  Версия: 24.04
+
+Ядро:
+6.17.0-19-generic
+
+Архитектура:
+x86_64
+
+Дата и время:
+Вт 31 мар 2026 22:52:47 MSK
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  PYTHON ОКРУЖЕНИЕ
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+✓ Виртуальное окружение активно: /home/makleso6/legendary-potato/venv
+
+Python версия:
+Python 3.12.3
+  Путь: /home/makleso6/legendary-potato/venv/bin/python3
+
+pip версия:
+pip 26.0.1 from /home/makleso6/legendary-potato/venv/lib/python3.12/site-packages/pip (python 3.12)
+
+Установленные Python пакеты (основные):
+✓ numpy: 2.4.4
+✗ opencv-python не установлен
+✓ tqdm: 4.67.3
+✓ rich: unknown
+✓ scenedetect: 0.6.7.1
+✓ vapoursynth: R74
+✓ tensorrt: 10.16.0.72
+✓ vsrepo: 1.0.0
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  NVIDIA / CUDA
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+✓ nvidia-smi найден
+
+24689{NC} nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
+  NVIDIA GeForce RTX 5080, 580.126.09, 16303 MiB
+
+CUDA версия из драйвера:
+  13.0
+
+✓ nvcc (CUDA Toolkit) найден
+  Версия: 12.0,
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  TENSORRT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+✓ trtexec найден: /opt/tensorrt/bin/trtexec
+
+24689{NC} trtexec --version 2>&1 | head -3
+  &&&& RUNNING TensorRT.trtexec [TensorRT v101600] [b72] # trtexec --version
+  [03/31/2026-22:52:48] [I] TF32 is enabled by default. Add --noTF32 flag to further improve accuracy with some performance cost.
+  === Model Options ===
+
+Поиск libnvinfer.so:
+✓ /opt/tensorrt/lib/stubs/libnvinfer.so
+✓ /opt/tensorrt/lib/libnvinfer.so.10
+✓ /opt/tensorrt/lib/libnvinfer.so
+✓ /opt/tensorrt/lib/libnvinfer.so.10.16.0
+
+✓ TensorRT Python API: 10.16.0.72
+
+✓ TensorRT директория: /opt/tensorrt
+  Содержимое:
+    итого 32
+    drwxr-xr-x 8 makleso6 makleso6 4096 мар 31 22:14 .
+    drwxr-xr-x 4 root     root     4096 мар 31 22:14 ..
+    drwxr-xr-x 2 makleso6 makleso6 4096 мар 10 07:24 bin
+    drwxr-xr-x 2 makleso6 makleso6 4096 мар 10 07:24 doc
+    drwxr-xr-x 3 makleso6 makleso6 4096 мар 10 07:24 include
+    drwxr-xr-x 3 makleso6 makleso6 4096 мар 10 07:24 lib
+    drwxr-xr-x 2 makleso6 makleso6 4096 мар 10 07:24 python
+    drwxr-xr-x 3 makleso6 makleso6 4096 мар 10 07:24 targets
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  VAPOURSYNTH
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+✓ VapourSynth: R74
+
+Поиск vapoursynth библиотек:
+  /usr/lib/x86_64-linux-gnu/libvapoursynth.so
+
+Директории плагинов VapourSynth:
+✓ /home/makleso6/.local/lib/vapoursynth
+  Плагины (.so):
+basename: пропущен операнд
+По команде «basename --help» можно получить дополнительную информацию.
+✓ /usr/lib/x86_64-linux-gnu/vapoursynth
+  Плагины (.so):
+    - libimwri.so
+    - libocr.so
+    - libremovegrain.so
+    - libsubtext.so
+    - libvivtc.so
+⚠ /usr/local/lib/vapoursynth не существует
+
+Тест загрузки плагинов в VapourSynth:
+Traceback (most recent call last):
+  File "<stdin>", line 4, in <module>
+AttributeError: module 'vapoursynth' has no attribute 'API_VERSION'
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  FFMPEG
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+✓ ffmpeg найден: /usr/bin/ffmpeg
+
+24689{NC} ffmpeg -version | head -3
+  ffmpeg version 6.1.1-3ubuntu5 Copyright (c) 2000-2023 the FFmpeg developers
+  built with gcc 13 (Ubuntu 13.2.0-23ubuntu3)
+  configuration: --prefix=/usr --extra-version=3ubuntu5 --toolchain=hardened --libdir=/usr/lib/x86_64-linux-gnu --incdir=/usr/include/x86_64-linux-gnu --arch=amd64 --enable-gpl --disable-stripping --disable-omx --enable-gnutls --enable-libaom --enable-libass --enable-libbs2b --enable-libcaca --enable-libcdio --enable-libcodec2 --enable-libdav1d --enable-libflite --enable-libfontconfig --enable-libfreetype --enable-libfribidi --enable-libglslang --enable-libgme --enable-libgsm --enable-libharfbuzz --enable-libmp3lame --enable-libmysofa --enable-libopenjpeg --enable-libopenmpt --enable-libopus --enable-librubberband --enable-libshine --enable-libsnappy --enable-libsoxr --enable-libspeex --enable-libtheora --enable-libtwolame --enable-libvidstab --enable-libvorbis --enable-libvpx --enable-libwebp --enable-libx265 --enable-libxml2 --enable-libxvid --enable-libzimg --enable-openal --enable-opencl --enable-opengl --disable-sndio --enable-libvpl --disable-libmfx --enable-libdc1394 --enable-libdrm --enable-libiec61883 --enable-chromaprint --enable-frei0r --enable-ladspa --enable-libbluray --enable-libjack --enable-libpulse --enable-librabbitmq --enable-librist --enable-libsrt --enable-libssh --enable-libsvtav1 --enable-libx264 --enable-libzmq --enable-libzvbi --enable-lv2 --enable-sdl2 --enable-libplacebo --enable-librav1e --enable-pocketsphinx --enable-librsvg --enable-libjxl --enable-shared
+
+Проверка фильтров ffmpeg:
+✓ vidstabdetect
+✓ vidstabtransform
+✓ scale_cuda
+⚠ scale_npp отсутствует
+
+Кодеки NVIDIA (nvenc):
+✓ h264_nvenc доступен
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  ДОПОЛНИТЕЛЬНЫЕ УТИЛИТЫ
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+✓ exiftool: /usr/bin/exiftool
+✓ mediainfo: /usr/bin/mediainfo
+✓ 7z: /usr/bin/7z
+✓ git: /usr/bin/git
+⚠ cmake не найден
+⚠ ninja не найден
+✓ wget: /usr/bin/wget
+⚠ curl не найден
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  СТРУКТУРА ПРОЕКТА
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+✓ Директория проекта: /home/makleso6/legendary-potato
+
+Содержимое:
+  итого 9941508
+  drwxrwxr-x  9 makleso6 makleso6       4096 мар 31 22:37 .
+  drwxr-x--- 19 makleso6 makleso6       4096 мар 31 22:25 ..
+  -rw-rw-r--  1 makleso6 makleso6      19755 мар 31 21:09 Brainstorm.md
+  drwxrwxr-x  2 makleso6 makleso6       4096 мар 31 21:09 .claude
+  -rw-rw-r--  1 makleso6 makleso6       4332 апр 20  2023 cuda-keyring_1.1-1_all.deb
+  -rwxrwxr-x  1 makleso6 makleso6      13534 мар 31 21:09 enhance_concert.sh
+  drwxrwxr-x  8 makleso6 makleso6       4096 мар 31 21:09 .git
+  -rw-rw-r--  1 makleso6 makleso6       1239 мар 31 21:09 .gitignore
+  drwxrwxr-x  2 makleso6 makleso6       4096 мар 31 21:36 models
+  -rw-rw-r--  1 makleso6 makleso6       8272 мар 31 21:09 pipeline.py
+  drwxrwxr-x  2 makleso6 makleso6       4096 мар 31 22:52 setup
+  -rw-rw-r--  1 makleso6 makleso6 7568039306 мар 31 22:03 TensorRT-10.16.0.72.Linux.x86_64-gnu.cuda-13.2.tar.gz
+  drwxrwxr-x  2 makleso6 makleso6       4096 мар 31 21:09 utils
+  drwxrwxr-x  5 makleso6 makleso6       4096 мар 31 21:18 venv
+  drwxrwxr-x  2 makleso6 makleso6       4096 мар 26 04:51 vsmlrt-cuda
+  -rw-rw-r--  1 makleso6 makleso6 2147483647 мар 31 22:33 vsmlrt-cuda.v15.16.7z.001
+  -rw-rw-r--  1 makleso6 makleso6  464467988 мар 31 22:33 vsmlrt-cuda.v15.16.7z.002
+
+Директория setup/:
+  итого 68
+  drwxrwxr-x 2 makleso6 makleso6  4096 мар 31 22:52 .
+  drwxrwxr-x 9 makleso6 makleso6  4096 мар 31 22:37 ..
+  -rwxrwxr-x 1 makleso6 makleso6  9726 мар 31 22:30 01_setup_env.sh
+  -rwxrwxr-x 1 makleso6 makleso6  5207 мар 31 21:09 02_build_trt_engines.sh
+  -rwxrwxr-x 1 makleso6 makleso6  8016 мар 31 22:13 03.sh
+  -rwxrwxr-x 1 makleso6 makleso6 10407 мар 31 22:45 build_vsmlrt.sh
+  -rwxrwxr-x 1 makleso6 makleso6 17670 мар 31 22:52 env.sh
+
+Директория models/:
+  ONNX модели:
+  TensorRT engines:
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PATH:
+  /home/makleso6/legendary-potato/venv/bin
+  /opt/tensorrt/bin
+  /opt/tensorrt/bin
+  /opt/tensorrt/bin
+  /usr/local/sbin
+  /usr/local/bin
+  /usr/sbin
+  /usr/bin
+  /sbin
+  /bin
+  /usr/games
+  /usr/local/games
+  /snap/bin
+  /snap/bin
+
+LD_LIBRARY_PATH:
+  /opt/tensorrt/lib
+  
+  /opt/tensorrt/lib
+  /opt/tensorrt/lib
+  
+
+⚠ PYTHONPATH не установлена
+
+⚠ CUDA_HOME не установлена
+
+TENSORRT_DIR:
+  /opt/tensorrt
+
+VIRTUAL_ENV:
+  /home/makleso6/legendary-potato/venv
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  ИТОГОВАЯ СВОДКА
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Критичные компоненты:
+✓ Python 3
+✓ Virtual environment
+✓ NVIDIA драйвер
+✓ trtexec (TensorRT)
+✓ VapourSynth
+✓ ffmpeg
+✓ PySceneDetect
+
+Опциональные компоненты:
+✓ vid.stab (стабилизация)
+⚠ vs-mlrt (для VapourSynth inference)
+
+════════════════════════════════════════════════════════════
+  ✓ ВСЕ КРИТИЧНЫЕ КОМПОНЕНТЫ УСТАНОВЛЕНЫ
+════════════════════════════════════════════════════════════
+
+Готов к запуску: ./setup/02_build_trt_engines.sh
+
+════════════════════════════════════════════════════════════
+Сохрани вывод этого скрипта и отправь для анализа
+════════════════════════════════════════════════════════════
